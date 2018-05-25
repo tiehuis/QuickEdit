@@ -1,0 +1,39 @@
+QuickEdit (qe) - v0.2.0
+=======================
+
+A tiny editor intended for quick edits of gigantic files.
+
+Features
+--------
+
+ * Handle arbitrary long lines
+ * Insert only edit support for huge files
+ * Instant write/save
+ * Fast searching (rudimentary)
+ * Simple viewer alternative to less (faster for long lines)
+ * No memory allocation (uses mmap)
+ * Simple modal interface
+
+Downsides
+---------
+
+ * No syntax highlighting
+ * Edit support is limited. Cannot change file length.
+
+How is it fast?
+---------------
+
+ * Uses virtual memory and paging to avoid having to load the entire file into
+   memory.
+ * Doesn't use a fancy data structure for editing, works on the raw bytes.
+ * Doesn't have many features
+
+Installation
+------------
+
+Requires linux and a C99 compiler.
+
+```
+git clone https://github.com/tiehuis/QuickEdit
+make
+```

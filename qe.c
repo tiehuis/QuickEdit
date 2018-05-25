@@ -1,20 +1,8 @@
 /*
- * QuickEdit (qe) - v0.1.0
+ * QuickEdit (qe) - v0.2.0
  * =======================
  *
- * A small editor intended for quick edits.
- *
- *  - Handles arbitrarily long lines
- *  - Allows partial file edits on huge files (?)
- *  - Simple viewer alternative to less
- *
- * How is it fast?
- * ===============
- *
- *  - Does not need to load complete files.
- *  - Minimises dealing/thinking with lines.
- *  - Does not use fancy editing structures such as ropes/skip-lists.
- *  - Doesn't do that much.
+ * A tiny editor intended for quick edits of gigantic files.
  *
  * ----------------------------------------------------------------------------
  *
@@ -43,78 +31,130 @@
  */
 
 #define _GNU_SOURCE
+#define _FILE_OFFSET_BITS 64
 
+#include <assert.h>
+#include <ctype.h>
+#include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <fcntl.h>
+#include <sched.h>
+#include <signal.h>
+#include <termios.h>
+#include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/types.h>
 #include <sys/stat.h>
-#include <signal.h>
-#include <errno.h>
-#include <termios.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <unistd.h>
+#include <sys/types.h>
 
-struct {
-    // Name of the file being edited. Points to argv.
-    char *filename;
+enum edit_mode {
+    MODE_NORMAL = 0,
+    MODE_INSERT,
+    MODE_SEARCH,
+};
 
-    // File descriptor of file being edited.
+static const char *edit_mode_string[] = {
+    "NORMAL",
+    "INSERT",
+    "SEARCH",
+};
+
+static struct {
+    // Filename of <file>. Points to argv.
+    const char *filename;
+
+    // File descriptor of <file>.
     int fd;
 
-    // Information of the file being edited.
+    // Stat info of <file>.
     struct stat file;
 
-    // Whether the onscreen content matches the underlying editor context.
+    // Whether view matches editor state.
     volatile sig_atomic_t dirty;
 
-    // Stores messages to be displayed at the bottom of the screen.
-    char status_buffer[40];
+    // dirty implies the following but the converse is not true. These flags
+    // are for more efficient partial redraws.
+    int dirty_cursor;
+    int dirty_status;
 
-    // Current page mapped into memory.
-    //
-    // TODO: This maps the whole file into memory. Is this the best approach?
-    // Is extra manual management required for efficiency?
+    // Whether the file should be mapped in read-only mode. If read-only, then
+    // insert mode is completely disabled.
+    int read_only;
+
+    // Whether edits should be synced to the page instantly or batched until
+    // explicitly requested by the user.
+    int batched_save;
+
+    // Whether we are in wrapping mode (default: no wrap)
+    int wrap;
+
+    // Messages on bottom of screen.
+    char status_buffer[64];
+
+    // Virtual memory-mapped pages of <file>.
     uint8_t *page;
 
-    // Byte offset into the current page. Should always be on new line boundary.
+    // Byte offset into <page>. Always on new-line boundary.
+    //
+    // TODO: Not always on new-line boundary if wrapping extends over an entire
+    // view page itself. In this case we want to adjust page_offset to a
+    // non-boundary and proceed as normal, changes how page movement occurs
+    // depending on the mode, though.
+    //
+    // We cannot use a size_t for our offset since mapped file may be larger
+    // than the address space in say a 32-bit system.
+    //
+    // 63-bits should be sufficient and makes some compares a bit nicer.
     int64_t page_offset;
 
-    // Offset from start of line shifting the content left-right.
-    int64_t page_offset_lr;
+    // X-axis offset from <page_offset>.
+    int64_t page_offset_x;
+
+    // Position of cursor in editor (0-indexed, relative to window).
+    uint16_t cursor_x;
+    uint16_t cursor_y;
+
+    // Current active edit mode.
+    enum edit_mode mode;
+
+    // Buffer for search string.
+    char search_buf[64];
+
+    // Length of current search term.
+    size_t search_len;
 } editor;
 
-struct {
-    // Width of the terminal.
-    int32_t cols;
+static struct {
+    // Terminal dimensions.
+    int16_t width;
+    int16_t height;
 
-    // Height of the terminal.
-    int32_t rows;
+    // Whether a terminal resize event occurred.
+    volatile sig_atomic_t resized;
 
-    // Whether the terminal has been resized and requires synchronization.
-    volatile sig_atomic_t was_resized;
-
-    // Original settings of the terminal before the program was started.
+    // Original terminal settings prior to program start.
     struct termios original_settings;
 
-    // Whether we have entered raw mode in the terminal yet.
-    //
-    // This is required to perform a clean exit in case we fail before the
-    // terminal has been correctly set up.
+    // Whether we have entered raw mode yet. Used only if we encounter an
+    // error before the terminal setup was complete.
     int raw_mode;
 } terminal;
 
-void qe_terminal_cleanup(void)
+static void qe_terminal_cleanup(void)
 {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &terminal.original_settings);
+
+    // restore screen content
     printf("\x1b[?47l");
 }
 
-void fatal(const char *msg)
+__attribute__((noreturn))
+static void fatal(const char *msg)
 {
     if (terminal.raw_mode) {
         qe_terminal_cleanup();
@@ -128,83 +168,155 @@ void fatal(const char *msg)
     exit(1);
 }
 
-// Perform a complete redraw of the editor content.
-//
-// This performs no buffering and will always result in a complete screen
-// refresh followed by printing of the current content.
-//
-// TODO: Double-buffer existing content where we can. Prefer pre-building the
-// content to print and perform a single write call. The internal printf
-// buffer may not be sufficient.
-void qe_draw(void)
+// TODO: Print \x08 byte value and return character printed count
+// (don't exceed end).
+static void print_char(char c)
+{
+    if (isprint(c)) {
+        putchar(c);
+    } else {
+        printf("\x1b[2m");  // dim
+        putchar('@');
+        printf("\x1b[0m");  // reset color
+    }
+}
+
+static int qe_draw_wrap(void)
 {
     int64_t offset = editor.page_offset;
-
-    printf("\x1b[?25l\x1b[2J\x1b[H");
     int y;
-    for (y = 0; y < terminal.rows - 1; ++y) {
-        // Clip pre-buffer line content.
-        for (int i = 0; i < editor.page_offset_lr; ++i) {
-            const char ch = editor.page[offset];
+    for (y = 0; y < terminal.height - 1; ++y) {
+        for (int x = 0; x < terminal.width - 1; ++x) {
+            const char c = editor.page[offset];
             offset += 1;
 
             if (offset >= editor.file.st_size) {
-                printf("\x1b[E");
-                goto finish_draw;
+                goto file_end;
             }
 
-            if (ch == '\n') {
-                goto next_row;
-            }
-        }
-
-        int x;
-        for (x = 0; x < terminal.cols; ++x) {
-            const char ch = editor.page[offset];
-            offset += 1;
-
-            if (offset >= editor.file.st_size) {
-                printf("\x1b[E");
-                goto finish_draw;
-            }
-
-            if (ch == '\n') {
+            if (c == '\n') {
                 goto next_row;
             } else {
-                printf("%c", ch);
+                print_char(c);
             }
         }
 
-        // Clip post-buffer line content.
-        if (x == terminal.cols) {
-            while (editor.page[offset++] != '\n') {
-                if (offset >= editor.file.st_size) {
-                    printf("\x1b[E");
-                    goto finish_draw;
-                }
+next_row:
+        printf("\x1b[E");
+    }
+
+    return y;
+
+file_end:
+    printf("\x1b[E");
+    return y;
+}
+
+static int qe_draw_nowrap(void)
+{
+    int64_t offset = editor.page_offset;
+    int y;
+    for (y = 0; y < terminal.height - 1; ++y) {
+        // clip start of lines
+        if (offset + editor.page_offset_x >= editor.file.st_size) {
+            goto file_end;
+        }
+        uint8_t *beg = memchr(editor.page + offset, '\n', editor.page_offset_x);
+        if (beg) {
+            // new-line encountered so early break
+            goto next_row;
+        }
+        offset += editor.page_offset_x;
+
+        int x;
+        for (x = 0; x < terminal.width; ++x) {
+            const char c = editor.page[offset];
+            offset += 1;
+
+            if (offset >= editor.file.st_size) {
+                goto file_end;
+            }
+
+            if (c == '\n') {
+                goto next_row;
+            } else {
+                print_char(c);
             }
         }
+
+        // Clip line endings (scan for next).
+        // This needs to be fast to handle files with very long single lines.
+        // So we prefer memchr vs. a simple loop.
+        uint8_t *end = memchr(editor.page + offset, '\n', editor.file.st_size - offset);
+        if (!end) {
+            goto file_end;
+        }
+
+        offset = end - &editor.page[offset];
 
     next_row:
         printf("\x1b[E");
     }
 
-finish_draw:
-    // Show marker rows at end of file.
-    for (; y < terminal.rows - 1; ++y) {
+    return y;
+
+file_end:
+    printf("\x1b[E");
+    return y;
+}
+
+static void qe_draw_cursor(void)
+{
+    // move cursor to x,y
+    printf("\x1b[%d;%dH", editor.cursor_y + 1, editor.cursor_x + 1);
+    editor.dirty_cursor = 0;
+}
+
+static void qe_draw_status(void)
+{
+    printf("\x1b[2;7m");  // invert color, dim
+
+    int at_end = 0;
+    for (int i = 0; i < terminal.width; ++i) {
+        if (editor.status_buffer[i] == 0) {
+            at_end = 1;
+        }
+        putchar(!at_end ? editor.status_buffer[i] : ' ');
+    }
+
+    printf("\x1b[0m");  // reset color
+    editor.dirty_status = 0;
+}
+
+// Draw entire editor content to terminal. No delta is computed so a complete
+// redraw is always performed. Only required when editor.dirty is true.
+static void qe_draw(void)
+{
+    // hide cursor, clear screen, move cursor to 0,0
+    printf("\x1b[?25l\x1b[2J\x1b[H");
+
+    int y = editor.wrap ? qe_draw_wrap() : qe_draw_nowrap();
+
+    // end of file markers
+    for (; y < terminal.height - 1; ++y) {
         printf("~\x1b[E");
     }
 
-    printf("\x1b[7m");
-    printf("%s", editor.status_buffer);
-    printf("\x1b[0m");
+    qe_draw_status();
+
+    qe_draw_cursor();
+
+    // show cursor
     printf("\x1b[?25h");
 
+    qe_draw_cursor();
+
     fflush(stdout);
+
     editor.dirty = 0;
 }
 
-void qe_terminal_init(void)
+static void qe_terminal_init(void)
 {
     struct termios raw_settings;
 
@@ -228,12 +340,13 @@ void qe_terminal_init(void)
         fatal("failed to set new terminal settings");
     }
 
+    // save screen content (for restore)
     printf("\x1b[?47h");
     terminal.raw_mode = 1;
     atexit(qe_terminal_cleanup);
 }
 
-void qe_winsize(void)
+static void qe_winsize(void)
 {
     struct winsize w;
 
@@ -241,9 +354,9 @@ void qe_winsize(void)
         fatal("failed to get terminal size");
     }
 
-    terminal.cols = w.ws_col;
-    terminal.rows = w.ws_row;
-    terminal.was_resized = 0;
+    terminal.width = w.ws_col;
+    terminal.height = w.ws_row;
+    terminal.resized = 0;
 }
 
 // Called if the window is resized.
@@ -252,14 +365,14 @@ void qe_winsize(void)
 // the program the chance to update the screen again.
 //
 // TODO: Does not catch the case of stacking <-> tiling in i3.
-void qe_winsize_sighandler(int signo)
+static void qe_winsize_sighandler(int signo)
 {
     (void) signo;
-    terminal.was_resized = 1;
+    terminal.resized = 1;
     editor.dirty = 1;
 }
 
-void qe_winsize_sighandler_init(void)
+static void qe_winsize_sighandler_init(void)
 {
     struct sigaction sa;
     sigemptyset(&sa.sa_mask);
@@ -271,7 +384,7 @@ void qe_winsize_sighandler_init(void)
     }
 }
 
-void qe_init(void)
+static void qe_init(void)
 {
     memset(&editor, 0, sizeof(editor));
     editor.filename = NULL;
@@ -280,7 +393,10 @@ void qe_init(void)
     editor.page = NULL;
 
     memset(&terminal, 0, sizeof(terminal));
+}
 
+static void qe_init_terminal()
+{
     qe_terminal_init();
     qe_winsize();
     qe_winsize_sighandler_init();
@@ -307,19 +423,49 @@ enum keycode {
     ARROW_LEFT
 };
 
-void qe_args(int argc, char **argv)
+static void qe_args(int argc, char **argv)
 {
-    if (argc != 2) {
-        fatal("usage: qe <filename>");
+    const char *help =
+        "usage: qe [options] filename\n"
+        "\n"
+        "   -ro   read-only\n"
+        "   -s    no automatic save/sync (unimplemented)\n"
+        "   -w    wrap\n"
+        "   -h    print help"
+        ;
+
+    for (int i = 1; i < argc; ++i) {
+        const char *a = argv[i];
+        if (a[0] == '-') {
+            if (!strcmp(a, "-ro")) {
+                editor.read_only = 1;
+            } else if (!strcmp(a, "-s")) {
+                editor.batched_save = 1;
+            } else if (!strcmp(a, "-w")) {
+                editor.wrap = 1;
+            } else if (!strcmp(a, "-h")) {
+                fatal(help);
+            } else {
+                fatal("unknown argument");
+            }
+        } else {
+            if (editor.filename != NULL) {
+                fatal("only one filename is allowed");
+            }
+
+            editor.filename = a;
+        }
     }
 
-    editor.filename = argv[1];
+    if (editor.filename == NULL) {
+        fatal(help);
+    }
 }
 
-void qe_open(void)
+static void qe_open(void)
 {
-    // TODO: Check if we can optimize flags to open for mmap usage.
-    editor.fd = open(editor.filename, O_RDONLY);
+    int open_flags = editor.read_only ? O_RDONLY : O_RDWR;
+    editor.fd = open(editor.filename, open_flags);
     if (editor.fd == -1) {
         fatal("failed to open file");
     }
@@ -328,8 +474,8 @@ void qe_open(void)
         fatal("failed to fstat file");
     }
 
-    editor.page = mmap(NULL, editor.file.st_size, PROT_READ, MAP_SHARED,
-                       editor.fd, 0);
+    int mmap_flags = editor.read_only ? PROT_READ : PROT_WRITE | PROT_READ;
+    editor.page = mmap(NULL, editor.file.st_size, mmap_flags, MAP_SHARED, editor.fd, 0);
     if (editor.page == MAP_FAILED) {
         fatal("failed to mmap file");
     }
@@ -340,23 +486,26 @@ void qe_open(void)
 // This keeps track of the filename and current file position. It must be called
 // if page_offset is modified.
 //
-// TODO: Handle page_offset_lr movement.
-void qe_update_status_buffer(void)
+// TODO: Handle page_offset_x movement.
+static void qe_update_status_buffer(void)
 {
-    int through = 0;
+    int64_t through = 0;
     if (editor.page_offset != 0) {
         through = 100ll * editor.page_offset / editor.file.st_size;
     }
 
     snprintf(editor.status_buffer, sizeof(editor.status_buffer),
-             "%3d%% - %.32s", through, editor.filename);
+             "%s: %3"PRId64"%% - %.32s (+%"PRId64") (%"PRId64"/%"PRId64")",
+             edit_mode_string[editor.mode],
+             through, editor.filename, editor.page_offset_x,
+             editor.page_offset + editor.page_offset_x, editor.file.st_size);
 }
 
 // Scan from the current page offset past `n` newlines and set the new page
 // offset. A negative value indicates reverse traversal.
 //
 // Stops if the edge of a file is reached.
-void qe_scan_past_newlines(int32_t n)
+static void qe_move_window_y(int32_t n)
 {
     const int step = n > 0 ? 1 : -1;
     const int32_t an = n > 0 ? n : -n;
@@ -365,15 +514,31 @@ void qe_scan_past_newlines(int32_t n)
     while (1) {
         if (editor.page_offset < 0) {
             editor.page_offset = 0;
-            break;
+            qe_update_status_buffer();
+            return;
         }
         if (editor.page_offset >= editor.file.st_size) {
             editor.page_offset = editor.file.st_size - 1;
-            break;
+            qe_update_status_buffer();
+            return;
         }
 
         if (editor.page[editor.page_offset] == '\n') {
             if (++i > an) {
+                editor.page_offset += step;
+
+                // if moving backwards, we are at the end of the line, move
+                // to the start (or start of file).
+                if (step < 0) {
+                    while (editor.page_offset != 0 && editor.page[editor.page_offset] != '\n') {
+                        editor.page_offset -= 1;
+                    }
+
+                    if (editor.page_offset != 0) {
+                        editor.page_offset += 1;
+                    }
+                }
+
                 break;
             }
         }
@@ -388,28 +553,155 @@ void qe_scan_past_newlines(int32_t n)
 // Shift the buffer view left or right.
 //
 // TODO: Stop shifting if we have buffer is empty.
-void qe_scan_left_right(int32_t n)
+static void qe_move_window_x(int32_t n)
 {
-    editor.page_offset_lr += n;
+    editor.page_offset_x += n;
 
-    if (editor.page_offset_lr < 0) {
-        editor.page_offset_lr = 0;
+    if (editor.page_offset_x < 0) {
+        editor.page_offset_x = 0;
+        qe_update_status_buffer();
+        return;
     }
 
     qe_update_status_buffer();
     editor.dirty = 1;
 }
 
+// Return the current byte position offset of the cursor.
+//
+// TODO: This needs to be fast as we use it on every cursor movement to check
+// if are at the end of a line. Cache new-lines to make this faster.
+//
+// TODO: Incorrect on non-first-line.
+static int64_t qe_get_cursor_byte_position(void)
+{
+    // scan forward past n new lines
+    int64_t offset = editor.page_offset;
+    for (int i = 0; i < editor.cursor_y; ++i) {
+        uint8_t *s = memchr(editor.page + offset, '\n', editor.file.st_size - offset);
+        if (!s) {
+            // eof, return last byte
+            return editor.file.st_size - 1;
+        }
+
+        offset = s - &editor.page[offset];
+        offset += 1;
+    }
+
+    offset += editor.page_offset_x + editor.cursor_x;
+
+    // could be passed the end of the file, cap
+    if (offset >= editor.file.st_size) {
+        offset = editor.file.st_size - 1;
+    }
+
+    return offset;
+}
+
+// Search at byte offset for the entry in the search-buffer. Returns -1
+// on no match (EOF) else returns the offset which the search term was found at.
+static int64_t qe_search(int64_t offset)
+{
+    // TODO: GNU specific
+    uint8_t *p = memmem(editor.page + offset, editor.file.st_size - offset,
+                        editor.search_buf, editor.search_len);
+    if (p == NULL) {
+        return -1;
+    }
+
+    return p - editor.page;
+}
+
+// Move the cursor, possibly moving the viewport if we exceed screen space.
+static void qe_move_cursor_x(int32_t x)
+{
+    assert(x != 0);
+
+    // TODO: Cursor cannot move right any more if next character is a newline
+    // get_byte_position and check next character.
+
+    int32_t new_x = editor.page_offset_x + editor.cursor_x + x;
+    // all the way to the left
+    if (new_x < 0) {
+        editor.page_offset_x = 0;
+        editor.cursor_x = editor.cursor_x == 0 ? 0 : terminal.width - 1;
+
+        qe_update_status_buffer();
+        editor.dirty = 1;
+    }
+    // off the right of the current view
+    else if (new_x >= terminal.width) {
+        // move the page offset in chunks (could adjust)
+        editor.page_offset_x = new_x - (new_x % terminal.width);
+        editor.cursor_x = new_x % terminal.width;
+
+        qe_update_status_buffer();
+        editor.dirty = 1;
+    }
+    // still in the current view
+    else {
+        if (x > 0) {
+            uint64_t off = qe_get_cursor_byte_position();
+            if (editor.page[off + 1] == '\n') {
+                // TODO: Allow y movement here (separate into different functions)
+                return;
+            }
+        }
+
+        editor.cursor_x += x;
+    }
+
+    editor.dirty_cursor = 1;
+}
+
+static void qe_move_cursor_y(int32_t y)
+{
+    assert(y != 0);
+
+    // TODO: on y cursor movement, truncate x cursor to max newline if needed
+    // but retain the current column as well on the next line. If an x movement
+    // occurs however then the virtual cursor is released.
+
+    int32_t new_y = editor.cursor_y + y;
+    // off the top
+    if (new_y < 0) {
+        // cannot scan cursor off top of first page
+        if (editor.page_offset == 0) {
+            return;
+        }
+
+        // scan back a page
+        qe_move_window_y(-terminal.height / 2);
+        editor.cursor_y = terminal.height - 2;
+        editor.dirty = 1;
+    }
+    // off the bottom
+    else if (new_y >= terminal.height - 1) {
+        qe_move_window_y(terminal.height / 2);
+        editor.cursor_y = 0;
+        editor.dirty = 1;
+    }
+    // still in current view
+    else {
+        editor.cursor_y += y;
+    }
+
+    editor.dirty_cursor = 1;
+}
+
 // Read a single input key.
 //
 // This blocks until user input is received OR a signal occurs.
-int qe_readkey(void)
+static int qe_readkey(void)
 {
-    int n;
+    ssize_t n;
     char c;
 
     errno = 0;
-    while ((n = read(STDIN_FILENO, &c, 1)) == 0) {}
+    while ((n = read(STDIN_FILENO, &c, 1)) == 0) {
+        sched_yield();
+    }
+
     if (n == -1) {
         // If a signal occurs during the above read call then it will fail
         // with the error code EINTR since we did not use SA_RESTART.
@@ -461,9 +753,9 @@ int qe_readkey(void)
                     case 'B':
                         return ARROW_DOWN;
                     case 'C':
-                        return ARROW_LEFT;
-                    case 'D':
                         return ARROW_RIGHT;
+                    case 'D':
+                        return ARROW_LEFT;
                     case 'H':
                         return HOME;
                     case 'F':
@@ -489,54 +781,257 @@ int qe_readkey(void)
     }
 }
 
-void qe_process_key(int c)
+static void qe_process_key(int c)
 {
-    switch (c) {
-        case 'q':
-        case CTRL('c'):
-            exit(0);
-            break;
+    switch (editor.mode) {
+        case MODE_NORMAL:
+        {
+            // normal mode
+            switch (c) {
+                // TODO: Are you sure on quit.
+                case 'q':
+                case CTRL('c'):
+                    exit(0);
 
-        case ARROW_DOWN:
-        case 'j':
-            qe_scan_past_newlines(1);
-            break;
+                case 'i':
+                    if (!editor.read_only) {
+                        editor.mode = MODE_INSERT;
+                    }
+                    break;
 
-        case ARROW_UP:
-        case 'k':
-            qe_scan_past_newlines(-1);
-            break;
+                case '/':
+                    editor.mode = MODE_SEARCH;
 
-        case PGDN:
-        case CTRL('d'):
-            qe_scan_past_newlines(terminal.rows - 1);
-            break;
+                    editor.status_buffer[0] = '/';
+                    editor.status_buffer[1] = 0;
 
-        case PGUP:
-        case CTRL('u'):
-            qe_scan_past_newlines(-(terminal.rows - 1));
-            break;
+                    editor.search_buf[0] = 0;
+                    editor.search_len = 0;
 
-        case ARROW_LEFT:
-        case 'l':
-            qe_scan_left_right(1);
-            break;
+                    editor.dirty = 1;
+                    break;
 
-        case ARROW_RIGHT:
-        case 'h':
-            qe_scan_left_right(-1);
-            break;
+                case 'r':
+                    // Force a refresh, useful if multiple editors at once on
+                    // the same file.
+                    editor.dirty = 1;
+                    break;
 
-        case CTRL('l'):
-            qe_scan_left_right(terminal.cols / 2);
-            break;
+                // TODO: Wrapping is currently very WIP so don't expect much.
+                case 'w':
+                    editor.wrap = !editor.wrap;
+                    editor.dirty = 1;
+                    break;
 
-        case CTRL('h'):
-            qe_scan_left_right(-terminal.cols / 2);
-            break;
+                case PGDN:
+                case CTRL('d'):
+                    qe_move_window_y(terminal.height - 1);
+                    break;
 
-        default:
-            break;
+                case PGUP:
+                case CTRL('u'):
+                    qe_move_window_y(-(terminal.height - 1));
+                    break;
+
+                case ARROW_DOWN:
+                case 'j':
+                    qe_move_cursor_y(1);
+                    break;
+
+                case ARROW_UP:
+                case 'k':
+                    qe_move_cursor_y(-1);
+                    break;
+
+                case ARROW_LEFT:
+                case 'h':
+                    qe_move_cursor_x(-1);
+                    break;
+
+                case ARROW_RIGHT:
+                case 'l':
+                    qe_move_cursor_x(1);
+                    break;
+
+                case CTRL('h'):
+                    qe_move_window_x(-terminal.width / 2);
+                    break;
+
+                case CTRL('l'):
+                    qe_move_window_x(terminal.width / 2);
+                    break;
+
+                default:
+                    break;
+            }
+        }
+        break;
+
+        case MODE_INSERT:
+        {
+            switch (c) {
+                case CTRL('c'):
+                    exit(0);
+
+                case ESC:
+                    editor.mode = MODE_NORMAL;
+                    break;
+
+                case PGDN:
+                case CTRL('d'):
+                    qe_move_window_y(terminal.height - 1);
+                    break;
+
+                case PGUP:
+                case CTRL('u'):
+                    qe_move_window_y(-(terminal.height - 1));
+                    break;
+
+                case ARROW_DOWN:
+                    qe_move_cursor_y(1);
+                    break;
+
+                case ARROW_UP:
+                    qe_move_cursor_y(-1);
+                    break;
+
+                case ARROW_LEFT:
+                    qe_move_cursor_x(-1);
+                    break;
+
+                case ARROW_RIGHT:
+                    qe_move_cursor_x(1);
+                    break;
+
+                case CTRL('h'):
+                    qe_move_window_x(-terminal.width / 2);
+                    break;
+
+                case CTRL('l'):
+                    qe_move_window_x(terminal.width / 2);
+                    break;
+
+                default:
+                {
+                    static size_t page_size = 0;
+                    if (page_size == 0) {
+                        page_size = (size_t) sysconf(_SC_PAGESIZE);
+                    }
+
+                    // TODO: Ringbuffer storing a sequence of edits. Head is the
+                    // first pending edit, tail is the latest edit to apply.
+                    //
+                    // Saving applies all edits to the file and keeps the edits
+                    // in the buffer as a history set.
+                    //
+                    // Need a sentinel value to signal incomplete buffer.
+                    //
+                    // This should actually be an option to require hitting
+                    // an explicit save. Still keep the undo buffer, though.
+                    int64_t off = qe_get_cursor_byte_position();
+                    editor.page[off] = c;
+
+                    // align to page
+                    uint8_t *page_addr = editor.page + off - (off % page_size);
+                    int r = msync(page_addr, page_size, MS_SYNC | MS_INVALIDATE);
+                    if (r == -1) {
+                        fatal("failed to msync");
+                    }
+
+                    // advance the cursor, possibly moving to the next line
+                    if (editor.page[off + 1] == '\n') {
+                        editor.cursor_x = 0;
+                        editor.cursor_y += 1;
+                        editor.dirty_cursor = 1;
+                    } else {
+                        qe_move_cursor_x(1);
+                    }
+
+                    // TODO: Partial dirty state would be good
+                    editor.dirty = 1;
+                }
+                break;
+            }
+        }
+        break;
+
+        case MODE_SEARCH:
+        {
+            switch (c) {
+                case CTRL('c'):
+                    exit(0);
+
+                case ESC:
+                    editor.mode = MODE_NORMAL;
+                    break;
+
+                case ENTER:
+                {
+                    // Search always switches mode
+                    editor.mode = MODE_NORMAL;
+
+                    // TODO: Add a flag to highlight the last match in the
+                    // buffer. Empty search highlighting?
+
+                    // Search from the current location forward.
+
+                    int64_t off = qe_get_cursor_byte_position();
+                    int64_t actual_addr = qe_search(off + 1);
+                    if (actual_addr == -1) {
+                        break;
+                    }
+
+                    int64_t addr = actual_addr;
+
+                    // Go to the address, then, go to the start of the line
+                    // where the entry occurred.
+                    while (addr > 0 && editor.page[addr] != '\n') {
+                        addr -= 1;
+                    }
+                    if (addr != 0) {
+                        addr += 1;
+                    }
+
+                    // TODO: Shift the page_offset_x in one computation directly.
+                    // based on terminal width.
+                    editor.page_offset = addr;
+
+                    // TODO: Round page_offset_x to editor terminal size and
+                    // set cursor based on this.
+                    editor.page_offset_x = actual_addr - addr;
+
+                    editor.dirty = 1;
+                }
+                break;
+
+                default:
+                    // cap search term to 64 characters
+                    if (editor.search_len >= sizeof(editor.search_buf) - 1) {
+                        break;
+                    }
+
+                    if (c != BACKSPACE) {
+                        editor.search_buf[editor.search_len++] = c;
+                        editor.search_buf[editor.search_len] = 0;
+                    } else {
+                        editor.search_len -= 1;
+                        if (editor.search_len == 0) {
+                            editor.search_len = 0;
+                        }
+
+                        editor.search_buf[editor.search_len] = 0;
+                    }
+
+                    // fill the status buffer so we can see what is being
+                    editor.status_buffer[0] = '/';
+                    editor.status_buffer[1] = 0;
+                    strncpy(editor.status_buffer + 1, editor.search_buf, sizeof(editor.status_buffer) - 1);
+                    editor.dirty = 1;
+
+                    break;
+            }
+        }
+        break;
     }
 }
 
@@ -545,11 +1040,22 @@ int main(int argc, char **argv)
     qe_init();
     qe_args(argc, argv);
     qe_open();
+    qe_init_terminal();
     qe_update_status_buffer();
 
     while (1) {
-        if (terminal.was_resized) {
+        if (terminal.resized) {
             qe_winsize();
+        }
+
+        // TODO: Move to bottom of screen and perform.
+        // if (editor.dirty_status) {
+        //     qe_draw_status();
+        // }
+
+        if (editor.dirty_cursor) {
+            qe_draw_cursor();
+            fflush(stdout);
         }
 
         if (editor.dirty) {
@@ -557,6 +1063,14 @@ int main(int argc, char **argv)
         }
 
         int c = qe_readkey();
+
+        // if the mode changes, update the buffer
+        enum edit_mode mode = editor.mode;
         qe_process_key(c);
+        // TODO: Change how we update the buffer
+        if (mode != editor.mode && editor.mode != MODE_SEARCH) {
+            qe_update_status_buffer();
+            editor.dirty = 1;
+        }
     }
 }
